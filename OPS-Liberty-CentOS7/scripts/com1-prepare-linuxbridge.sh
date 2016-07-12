@@ -7,11 +7,11 @@ echocolor "Installing CRUDINI"
 sleep 3
 yum -y install crudini
 
-echocolor "Configuring net forward for all VMs"
-sleep 5
-echo 'net.ipv4.conf.default.rp_filter=0' >> /etc/sysctl.conf
-echo 'net.ipv4.conf.all.rp_filter=0' >> /etc/sysctl.conf
-sysctl -p
+# echocolor "Configuring net forward for all VMs"
+# sleep 5
+# echo 'net.ipv4.conf.default.rp_filter=0' >> /etc/sysctl.conf
+# echo 'net.ipv4.conf.all.rp_filter=0' >> /etc/sysctl.conf
+# sysctl -p
 
 ###########################################################
 echocolor "Install and config NTP"
@@ -33,8 +33,7 @@ chronyc sources
 
 sleep 5
 echocolor "Installl package for NOVA"
-yum -y install openstack-nova-compute sysfsutils  openstack-neutron openstack-neutron-ml2 openstack-neutron-openvswitch
-
+yum -y install openstack-nova-compute sysfsutils 
 
 echocolor "Install & Configuring in nova.conf"
 sleep 5
@@ -43,12 +42,14 @@ nova_com=/etc/nova/nova.conf
 test -f $nova_com.orig || cp $nova_com $nova_com.orig
 
 ## [DEFAULT] Section
-ops_edit $nova_com DEFAULT rpc_backend rabbit
-ops_edit $nova_com DEFAULT auth_strategy keystone
 ops_edit $nova_com DEFAULT my_ip $COM1_MGNT_IP
+ops_edit $nova_com DEFAULT auth_strategy keystone
+ops_edit $nova_com DEFAULT rpc_backend rabbit
+
+
 ops_edit $nova_com DEFAULT network_api_class nova.network.neutronv2.api.API
 ops_edit $nova_com DEFAULT security_group_api neutron
-ops_edit $nova_com DEFAULT linuxnet_interface_driver nova.network.linux_net.LinuxOVSInterfaceDriver
+ops_edit $nova_com DEFAULT linuxnet_interface_driver nova.network.linux_net.NeutronLinuxBridgeInterfaceDriver
 ops_edit $nova_com DEFAULT firewall_driver nova.virt.firewall.NoopFirewallDriver
 ops_edit $nova_com DEFAULT memcached_servers $CTL_MGNT_IP:11211
 
@@ -61,7 +62,6 @@ ops_edit $nova_com oslo_messaging_rabbit rabbit_password $RABBIT_PASS
 ## [keystone_authtoken] section
 ops_edit $nova_com keystone_authtoken auth_uri http://$CTL_MGNT_IP:5000
 ops_edit $nova_com keystone_authtoken auth_url http://$CTL_MGNT_IP:35357
-
 ops_edit $nova_com keystone_authtoken auth_plugin password
 ops_edit $nova_com keystone_authtoken project_domain_id default
 ops_edit $nova_com keystone_authtoken user_domain_id default
@@ -100,12 +100,9 @@ sleep 5
 systemctl enable libvirtd.service openstack-nova-compute.service
 systemctl start libvirtd.service openstack-nova-compute.service
 
-# Remove default nova db
-rm /var/lib/nova/nova.sqlite
-
 echocolor "Install neutron-linuxbridge-agent (neutron) on COMPUTE NODE"
 sleep 5
-yum -y install  openstack-neutron openstack-neutron-ml2 openstack-neutron-openvswitch
+yum -y install  openstack-neutron-linuxbridge ebtables ipset
 
 echocolor "Config file neutron.conf"
 neutron_com=/etc/neutron/neutron.conf
@@ -130,6 +127,10 @@ ops_edit $neutron_com keystone_authtoken project_name service
 ops_edit $neutron_com keystone_authtoken username neutron
 ops_edit $neutron_com keystone_authtoken password $NEUTRON_PASS
 
+ops_del $neutron_ctl keystone_authtoken identity_uri
+ops_del $neutron_ctl keystone_authtoken admin_tenant_name
+ops_del $neutron_ctl keystone_authtoken admin_user
+ops_del $neutron_ctl keystone_authtoken admin_password
 
 ## [database] section
 ops_del $neutron_com database connection
@@ -143,39 +144,33 @@ ops_edit $neutron_com oslo_messaging_rabbit rabbit_password $RABBIT_PASS
 ops_edit $neutron_com oslo_concurrency lock_path /var/lib/neutron/tmp
 
 
-############################## ml2_conf.ini ##############################
-echocolor "Configuring ml2_conf.ini"
-sleep 5
-ml2_clt=/etc/neutron/plugins/ml2/ml2_conf.ini
-test -f $ml2_clt.orig || cp $ml2_clt $ml2_clt.orig
-
-ops_edit $ml2_clt ml2 type_drivers flat,vlan,gre,vxlan
-ops_edit $ml2_clt ml2 tenant_network_types
-ops_edit $ml2_clt ml2 mechanism_drivers openvswitch
-
-## [securitygroup] section
-ops_edit $ml2_clt securitygroup enable_ipset True
-ops_edit $ml2_clt securitygroup enable_security_group  True
-ops_edit $ml2_clt securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
-
-echocolor "Configuring openvswitch_agent"
+echocolor "Configuring linuxbridge_agent"
 sleep 5
 ########
-ovsfile_com=/etc/neutron/plugins/ml2/openvswitch_agent.ini
-test -f $ovsfile_com.orig || cp $ovsfile_com $ovsfile_com.orig
+lbfile_com=/etc/neutron/plugins/ml2/linuxbridge_agent.ini
+test -f $lbfile_com.orig || cp $lbfile_com $lbfile_com.orig
 
-## [ovs] section
-ops_edit $ovsfile_com ovs bridge_mappings  physnet1:br-eth1
+## [linux_bridge] section
+ops_edit $lbfile_com linux_bridge physical_interface_mappings public:eth1
 
-ovs-vsctl add-br br-int 
-ovs-vsctl add-br br-eth1
-ovs-vsctl add-port br-eth1 eth1 
+# [vxlan] section
+ops_edit $lbfile_com vxlan enable_vxlan False
 
-echocolor "Reset service nova-compute,openvswitch"
+# [securitygroup] section
+ops_edit $lbfile_com securitygroup enable_security_group True
+ops_edit $lbfile_com securitygroup firewall_driver neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+
+## Create link 
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini 
+
+
+echocolor "Reset service nova-compute,linuxbridge"
 sleep 5
 
-systemctl start openvswitch
-systemctl enable openvswitch 
-systemctl restart openstack-nova-compute openstack-nova-metadata-api 
-systemctl start neutron-openvswitch-agent
-systemctl enable neutron-openvswitch-agent 
+systemctl restart openstack-nova-compute.service
+systemctl enable neutron-linuxbridge-agent.service
+systemctl start neutron-linuxbridge-agent.service
+
+echocolor "Reboot Server"
+sleep 5
+init 6

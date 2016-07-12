@@ -44,7 +44,7 @@ openstack endpoint create --region RegionOne \
 
 # SERVICE_TENANT_ID=`keystone tenant-get service | awk '$2~/^id/{print $4}'`
 
-echocolor "Install NEUTRON node - Using Linux Bridge"
+echocolor "Install NEUTRON node - Using openvswitch"
 sleep 5
 yum -y install  openstack-neutron openstack-neutron-ml2 openstack-neutron-openvswitch
   
@@ -60,13 +60,13 @@ test -f $neutron_ctl.orig || cp $neutron_ctl $neutron_ctl.orig
 ## [DEFAULT] section
 ops_edit $neutron_ctl DEFAULT core_plugin ml2
 ops_edit $neutron_ctl DEFAULT service_plugins router
-ops_edit $neutron_ctl DEFAULT rpc_backend rabbit
 ops_edit $neutron_ctl DEFAULT auth_strategy keystone
+ops_edit $neutron_ctl DEFAULT dhcp_agent_notification True
+ops_edit $neutron_ctl DEFAULT allow_overlapping_ips True
 ops_edit $neutron_ctl DEFAULT notify_nova_on_port_status_changes True
 ops_edit $neutron_ctl DEFAULT notify_nova_on_port_data_changes True
-ops_edit $neutron_ctl DEFAULT nova_url http://$CTL_MGNT_IP:8774/v2
+ops_edit $neutron_ctl DEFAULT rpc_backend rabbit
 ops_edit $neutron_ctl DEFAULT verbose True
-ops_edit $neutron_ctl DEFAULT allow_overlapping_ips True
 
 ## [database] section
 ops_edit $neutron_ctl database connection mysql+pymysql://neutron:$NEUTRON_DBPASS@$CTL_MGNT_IP/neutron
@@ -81,8 +81,14 @@ ops_edit $neutron_ctl keystone_authtoken project_name service
 ops_edit $neutron_ctl keystone_authtoken username neutron
 ops_edit $neutron_ctl keystone_authtoken password $NEUTRON_PASS
 
+ops_del $neutron_ctl keystone_authtoken identity_uri
+ops_del $neutron_ctl keystone_authtoken admin_tenant_name
+ops_del $neutron_ctl keystone_authtoken admin_user
+ops_del $neutron_ctl keystone_authtoken admin_password
+
 ## [oslo_messaging_rabbit] section
 ops_edit $neutron_ctl oslo_messaging_rabbit rabbit_host $CTL_MGNT_IP
+ops_edit $neutron_ctl oslo_messaging_rabbit rabbit_port 5672
 ops_edit $neutron_ctl oslo_messaging_rabbit rabbit_userid openstack
 ops_edit $neutron_ctl oslo_messaging_rabbit rabbit_password $RABBIT_PASS
 
@@ -96,8 +102,6 @@ ops_edit $neutron_ctl nova project_name service
 ops_edit $neutron_ctl nova username nova
 ops_edit $neutron_ctl nova password $NOVA_PASS
 
-## [oslo_concurrency] section
-ops_edit $neutron_ctl oslo_concurrency lock_path /var/lib/neutron/tmp
 
 ####################### Backup configuration of ML2 ################################
 echocolor "Configuring ML2"
@@ -117,20 +121,17 @@ ops_edit $ml2_clt ml2_type_flat flat_networks physnet1
 
 ## [securitygroup] section
 ops_edit $ml2_clt securitygroup enable_ipset True
-ops_edit $ml2_clt securitygroup enable_security_group  True
+ops_edit $ml2_clt securitygroup enable_security_group True
 ops_edit $ml2_clt securitygroup firewall_driver neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver
 
-# [ovs] section
-ops_edit $ovsfile bridge_mappings physnet1:br-eth1
-
-####################### Backup configuration of ML2 ################################
+####################### Backup configuration of openvswitch_agent ################################
 echocolor "Configuring openvswitch_agent"
 sleep 5
 ovsfile=/etc/neutron/plugins/ml2/openvswitch_agent.ini
 test -f $ovsfile.orig || cp $ovsfile $ovsfile.orig
 
 # [ovs] section
-ops_edit $ovsfile bridge_mappings physnet1:br-eth1
+ops_edit $ovsfile ovs bridge_mappings physnet1:br-eth1
 
 ####################### Configuring  L3 AGENT ################################
 netl3=/etc/neutron/l3_agent.ini
@@ -148,9 +149,8 @@ netdhcp=/etc/neutron/dhcp_agent.ini
 test -f $netdhcp.orig || cp $netdhcp $netdhcp.orig
 
 ## [DEFAULT] section
-ops_edit $netdhcp DEFAULT interface_driver neutron.agent.linux.interface.BridgeInterfaceDriver
+ops_edit $netdhcp DEFAULT interface_driver neutron.agent.linux.interface.OVSInterfaceDriver
 ops_edit $netdhcp DEFAULT dhcp_driver neutron.agent.linux.dhcp.Dnsmasq
-ops_edit $netdhcp DEFAULT enable_isolated_metadata True
 
 ####################### Configuring METADATA AGENT ################################
 echocolor "Configuring METADATA AGENT"
@@ -170,8 +170,13 @@ ops_edit $netmetadata DEFAULT project_name  service
 ops_edit $netmetadata DEFAULT username  neutron
 ops_edit $netmetadata DEFAULT password  $NEUTRON_PASS
 ops_edit $netmetadata DEFAULT nova_metadata_ip $CTL_MGNT_IP
+ops_edit $netmetadata DEFAULT nova_metadata_port 8775
 ops_edit $netmetadata DEFAULT metadata_proxy_shared_secret $METADATA_SECRET
 ops_edit $netmetadata DEFAULT verbose True
+
+ops_del $netmetadata DEFAULT admin_tenant_name
+ops_del $netmetadata DEFAULT admin_user
+ops_del $netmetadata DEFAULT admin_password 
 
 
 echocolor "Create a symbolic link"
@@ -183,11 +188,20 @@ sleep 3
 su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf \
   --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade head" neutron
   
-echocolor "Add bridge"
-sleep 3
-ovs-vsctl add-br br-int 
-ovs-vsctl add-br br-eth1 
-ovs-vsctl add-port br-eth1 eth1 
+### CONFIG NOVA FOR OVS
+nova_ctl=/etc/nova/nova.conf
+test -f $nova_ctl.orig1 || cp $nova_ctl $nova_ctl.orig1
+ops_edit $nova_ctl DEFAULT linuxnet_interface_driver nova.network.linux_net.LinuxOVSInterfaceDriver
+
+## Setup IP for br-eth1
+# yum install -y bridge-utils 
+
+# nmcli c add type bridge autoconnect yes con-name br-eth1 ifname br-eth1
+# nmcli c modify br-eth1 ipv4.addresses 172.16.69.40/24 ipv4.method manual
+# nmcli c modify br-eth1 ipv4.gateway 172.16.69.1
+# nmcli c modify br-eth1 ipv4.dns 8.8.8.8
+# nmcli c delete eth1 && nmcli c add type bridge-slave autoconnect yes con-name eth1 ifname eth1 master br-eth1
+
 
 echocolor "Restarting NEUTRON service"
 sleep 3
@@ -196,6 +210,7 @@ systemctl enable neutron-server
 systemctl start openvswitch 
 systemctl enable openvswitch
 systemctl restart neutron-openvswitch-agent 
+systemctl restart openstack-nova-api
 
 
 for service in dhcp-agent l3-agent metadata-agent openvswitch-agent; do
@@ -203,7 +218,38 @@ systemctl start neutron-$service
 systemctl enable neutron-$service
 done 
 
-echocolor "Check service Neutron"
-sleep 90
-neutron agent-list
+### Setup IP for bridge card
+echocolor "Setup IP for bridge card"
+sleep 5
+
+cat << EOF > /etc/sysconfig/network-scripts/ifcfg-eth1
+TYPE=Ethernet
+DEVICE="eth1"
+NAME=eth1
+ONBOOT=yes
+OVS_BRIDGE=br-eth1
+TYPE="OVSPort"
+DEVICETYPE="ovs"
+EOF
+
+cat << EOF > /etc/sysconfig/network-scripts/ifcfg-br-eth1
+DEVICE="br-eth1"
+BOOTPROTO="none"
+IPADDR=$CTL_EXT_IP
+PREFIX=$PREFIX_NETMASK_EXT
+GATEWAY=$GATEWAY_IP_EXT
+DNS1=$DNS_SERVER
+ONBOOT="yes"
+TYPE="OVSBridge"
+DEVICETYPE="ovs"
+EOF
+
+echocolor "Add bridge"
+sleep 3
+ovs-vsctl add-br br-int 
+ovs-vsctl add-br br-eth1 
+ovs-vsctl add-port br-eth1 eth1 
+
 echocolor "Finished install NEUTRON on CONTROLLER"
+init 6 
+
